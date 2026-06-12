@@ -6,6 +6,7 @@ local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local Event = game:GetService("ReplicatedStorage").REPLICATEDSTORAGE.Mechanics.Weapon
+local ChestbumpEvent = game:GetService("ReplicatedStorage").REPLICATEDSTORAGE.Mechanics.Chestbump
 
 -- === Config System ===
 local CONFIG_FOLDER = "OwnerPanel"
@@ -71,11 +72,15 @@ local AVOID_RADIUS = 20
 local jumpEnabled  = false
 local jumpPower    = 55.7
 local wasJumping   = false
-local aimKey  = "F"
-local jumpKey = "G"
+local chestSpoof   = false
+local chestDir     = "Right"
+local aimKey       = "F"
+local jumpKey      = "G"
+local chestKey     = "H"   -- default keybind for chest direction toggle
 
-local enableToggle, notifToggle, jumpToggle, avoidSlider
-local aimKeybind, jumpKeybind
+local enableToggle, notifToggle, jumpToggle, avoidSlider, chestToggle
+local aimKeybind, jumpKeybind, chestKeybind
+local chestDirDropdown  -- reference so we can update it on toggle
 local selectDropdown, autoDropdown
 
 -- === Active connections tracker ===
@@ -93,20 +98,26 @@ local function getCurrentConfig()
         avoidRadius  = AVOID_RADIUS,
         jumpEnabled  = jumpEnabled,
         jumpPower    = jumpPower,
-        aimKey       = (aimKeybind  and aimKeybind.Value)  or aimKey,
-        jumpKey      = (jumpKeybind and jumpKeybind.Value) or jumpKey,
+        chestSpoof   = chestSpoof,
+        chestDir     = chestDir,
+        aimKey       = (aimKeybind   and aimKeybind.Value)   or aimKey,
+        jumpKey      = (jumpKeybind  and jumpKeybind.Value)  or jumpKey,
+        chestKey     = (chestKeybind and chestKeybind.Value) or chestKey,
     }
 end
 
 local function applyConfig(data)
     if not data then return end
-    if data.avoidRadius  ~= nil then AVOID_RADIUS = data.avoidRadius;  if avoidSlider  then avoidSlider:Set(AVOID_RADIUS)  end end
-    if data.jumpPower    ~= nil then jumpPower    = data.jumpPower                                                              end
-    if data.enabled      ~= nil then enabled      = data.enabled;      if enableToggle  then enableToggle:Set(enabled)      end end
-    if data.jumpEnabled  ~= nil then jumpEnabled  = data.jumpEnabled;  if jumpToggle    then jumpToggle:Set(jumpEnabled)    end end
-    if data.notifEnabled ~= nil then notifEnabled = data.notifEnabled; if notifToggle   then notifToggle:Set(notifEnabled)  end end
-    if data.aimKey  ~= nil then aimKey  = data.aimKey;  if aimKeybind  then aimKeybind:Set(aimKey)   end end
-    if data.jumpKey ~= nil then jumpKey = data.jumpKey; if jumpKeybind then jumpKeybind:Set(jumpKey)  end end
+    if data.avoidRadius  ~= nil then AVOID_RADIUS = data.avoidRadius;  if avoidSlider      then avoidSlider:Set(AVOID_RADIUS)      end end
+    if data.jumpPower    ~= nil then jumpPower    = data.jumpPower                                                                       end
+    if data.enabled      ~= nil then enabled      = data.enabled;      if enableToggle     then enableToggle:Set(enabled)          end end
+    if data.jumpEnabled  ~= nil then jumpEnabled  = data.jumpEnabled;  if jumpToggle       then jumpToggle:Set(jumpEnabled)        end end
+    if data.notifEnabled ~= nil then notifEnabled = data.notifEnabled; if notifToggle      then notifToggle:Set(notifEnabled)      end end
+    if data.chestSpoof   ~= nil then chestSpoof   = data.chestSpoof;   if chestToggle      then chestToggle:Set(chestSpoof)        end end
+    if data.chestDir     ~= nil then chestDir     = data.chestDir;     if chestDirDropdown then chestDirDropdown:Set(chestDir)     end end
+    if data.aimKey   ~= nil then aimKey   = data.aimKey;   if aimKeybind   then aimKeybind:Set(aimKey)     end end
+    if data.jumpKey  ~= nil then jumpKey  = data.jumpKey;  if jumpKeybind  then jumpKeybind:Set(jumpKey)   end end
+    if data.chestKey ~= nil then chestKey = data.chestKey; if chestKeybind then chestKeybind:Set(chestKey) end end
 end
 
 -- === Window ===
@@ -123,6 +134,7 @@ local ConfigTab   = Window:Tab({ Title = "Configs",   Icon = "save"      })
 
 local SettingsSection    = FormlessTab:Section({ Title = "Settings"      })
 local AvoidSection       = FormlessTab:Section({ Title = "Avoidance"     })
+local ChestSection       = FormlessTab:Section({ Title = "Chest Bump"    })
 local KeybindSection     = FormlessTab:Section({ Title = "Keybinds"      })
 local JumpSection        = MovementTab:Section({ Title = "Jump Power"    })
 local JumpKeybindSection = MovementTab:Section({ Title = "Keybinds"      })
@@ -177,6 +189,46 @@ local function getGoalCFAndSize(goal)
     else return goal:GetBoundingBox() end
 end
 
+-- === Auto-detect real goal opening width ===
+-- Scans the goal model for posts/frame parts and computes
+-- the actual usable opening instead of the overextended bounding box.
+local function measureOpeningHalfWidth(goal)
+    local goalCF, goalSize = getGoalCFAndSize(goal)
+    local right  = goalCF.RightVector
+    local center = goalCF.Position
+    local bboxHalf = goalSize.X / 2
+
+    -- For a BasePart (like Net), scan the parent model; for a Model, scan itself
+    local container = goal:IsA("BasePart") and goal.Parent or goal
+
+    local leftEdge, rightEdge = -bboxHalf, bboxHalf
+
+    for _, part in ipairs(container:GetDescendants()) do
+        if part:IsA("BasePart") and part ~= goal then
+            local proj  = (part.Position - center):Dot(right)
+            local thick = math.min(part.Size.X, part.Size.Y, part.Size.Z) / 2
+
+            -- Only consider parts near the left/right extremes (likely posts)
+            if proj < -bboxHalf * 0.4 then
+                leftEdge = math.max(leftEdge, proj + thick + 0.5)
+            elseif proj > bboxHalf * 0.4 then
+                rightEdge = math.min(rightEdge, proj - thick - 0.5)
+            end
+        end
+    end
+
+    local halfW = math.max((rightEdge - leftEdge) / 2, 1)
+    return halfW
+end
+
+-- Cache the real opening widths once at startup
+local goalAHalfWidth = measureOpeningHalfWidth(goalA)
+local goalBHalfWidth = measureOpeningHalfWidth(goalB)
+
+local function getActiveHalfWidth()
+    return selectedGoal == goalA and goalAHalfWidth or goalBHalfWidth
+end
+
 local function updateSelectedGoal()
     local character = Players.LocalPlayer.Character
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
@@ -214,6 +266,61 @@ avoidSlider = AvoidSection:Slider({
     Value    = { Min = 1, Max = 50, Default = AVOID_RADIUS },
     Callback = function(val) AVOID_RADIUS = val end,
 })
+
+-- === Chest Bump Spoof ===
+chestToggle = ChestSection:Toggle({
+    Title    = "Spoof Chest Bump Direction",
+    Value    = false,
+    Callback = function(state)
+        chestSpoof = state
+        notify("Chest Bump", chestSpoof and "Spoofing enabled!" or "Spoofing disabled.", chestSpoof and "check" or "x", 2)
+    end,
+})
+
+chestDirDropdown = ChestSection:Dropdown({
+    Title    = "Bump Direction",
+    Values   = { "Right", "Left" },
+    Value    = chestDir,
+    Callback = function(option)
+        chestDir = option
+        notify("Chest Bump", "Direction set to: " .. option, "arrow-right", 2)
+    end,
+})
+
+-- === Chest Bump Direction Keybind ===
+-- Shared toggle function used by both the WindUI keybind and the raw listener below.
+local function chestDirToggle()
+    if not chestSpoof then return end
+    chestDir = (chestDir == "Right") and "Left" or "Right"
+    -- pcall: WindUI's Dropdown:Set() can throw when called from a keybind callback
+    -- context, which would silently swallow everything after it (including notify).
+    pcall(function()
+        if chestDirDropdown then chestDirDropdown:Set(chestDir) end
+    end)
+    notify("Chest Bump", "Direction → " .. chestDir, "arrow-right", 2)
+end
+
+-- WindUI Keybind handles normal keyboard keys.
+chestKeybind = ChestSection:Keybind({
+    Title    = "Toggle Bump Direction",
+    Value    = chestKey,
+    Callback = chestDirToggle,
+})
+
+-- Raw InputBegan listener: WindUI's Keybind callback does NOT fire for mouse
+-- buttons (e.g. MouseButton3 / middle click), so we catch them here manually.
+-- We also check for any other mouse button the user may have bound.
+trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    -- Only handle mouse-button inputs here; keyboard keys go through WindUI callback.
+    if input.KeyCode ~= Enum.KeyCode.Unknown then return end
+    local boundValue = (chestKeybind and chestKeybind.Value) or chestKey
+    -- WindUI stores the mouse button as e.g. "MouseButton3"
+    local inputName = input.UserInputType.Name  -- "MouseButton3", "MouseButton1", etc.
+    if inputName == boundValue or inputName == ("Mouse" .. boundValue) then
+        chestDirToggle()
+    end
+end))
 
 -- === Keybinds (Formless) ===
 aimKeybind = KeybindSection:Keybind({
@@ -378,28 +485,19 @@ task.defer(function()
     end
 end)
 
--- === Sliding / possession detection ===
-local SLIDE_COOLDOWN = 0.6
-local isSliding      = false
-local slideEndedAt   = -math.huge
+-- === Tackle / slide detection ===
+-- Track the Q key directly instead of relying on humanoid states
+local TACKLE_DURATION = 1.5   -- seconds to block auto-aim after Q press
+local lastTackleTime  = -math.huge
 
-trackConnection(RunService.Heartbeat:Connect(function()
-    local character = Players.LocalPlayer.Character
-    local hum = character and character:FindFirstChildOfClass("Humanoid")
-    if not hum then isSliding = false return end
-
-    local state      = hum:GetState()
-    local wasSliding = isSliding
-    isSliding = (state == Enum.HumanoidStateType.PlatformStanding)
-        or (state == Enum.HumanoidStateType.Running and hum.WalkSpeed <= 0)
-
-    if wasSliding and not isSliding then
-        slideEndedAt = os.clock()
+trackConnection(UserInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.Q then
+        lastTackleTime = os.clock()
     end
 end))
 
 local function slideBlocked()
-    return isSliding or (os.clock() - slideEndedAt < SLIDE_COOLDOWN)
+    return (os.clock() - lastTackleTime) < TACKLE_DURATION
 end
 
 -- === Jump Loop ===
@@ -455,7 +553,8 @@ trackConnection(RunService.Heartbeat:Connect(function(dt)
     if not selectedGoal then return end
     local goalCF, goalSize = getGoalCFAndSize(selectedGoal)
     local goalPos  = goalCF.Position
-    cachedHalfX    = goalSize.X / 2
+    -- Use the auto-detected opening width instead of the raw bounding box
+    cachedHalfX    = getActiveHalfWidth()
     -- Flip right vector for Side B since it faces the opposite direction
     cachedRightVec = selectedGoal == goalB and -goalCF.RightVector or goalCF.RightVector
     local nearestPlayer, nearestDist = getNearestPlayerToGoal(goalPos)
@@ -485,12 +584,14 @@ end))
 trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if not enabled then return end
+    if slideBlocked() then return end
     if input.KeyCode == Enum.KeyCode.R then
         -- Fresh random offset every shot for unpredictability
         if selectedGoal then
             local goalCF, goalSize = getGoalCFAndSize(selectedGoal)
             local goalPos = goalCF.Position
-            local halfX   = goalSize.X / 2
+            -- Use auto-detected opening width instead of raw bounding box
+            local halfX   = getActiveHalfWidth()
             local nearestPlayer, nearestDist = getNearestPlayerToGoal(goalPos)
             if nearestPlayer and nearestDist < AVOID_RADIUS then
                 local playerSide = (nearestPlayer.Position - goalPos):Dot(cachedRightVec)
@@ -503,6 +604,23 @@ trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcesse
             Event:InvokeServer("WEAPON1", "BIG BANG DRIVE", cachedDirection)
         end)
     end
+end))
+
+-- === Chest Bump Spoof Hook ===
+-- Intercepts the Chestbump FireServer and replaces the direction
+-- with a left/right vector relative to where the player is facing.
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+    if chestSpoof and getnamecallmethod() == "FireServer" and self.Name == "Chestbump" then
+        local cam = Workspace.CurrentCamera
+        if cam then
+            local right = cam.CFrame.RightVector
+            right = Vector3.new(right.X, 0, right.Z).Unit
+            local dir = (chestDir == "Right") and right or -right
+            return oldNamecall(self, dir, select(2, ...))
+        end
+    end
+    return oldNamecall(self, ...)
 end))
 
 WindUI:Notify({ Title = "Owner Panel", Content = "Loaded! Press Right Control to toggle.", Icon = "check", Duration = 3 })
