@@ -4,6 +4,7 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
 local Event = game:GetService("ReplicatedStorage").REPLICATEDSTORAGE.Mechanics.Weapon
 
 -- === Config System ===
@@ -70,15 +71,20 @@ local AVOID_RADIUS = 20
 local jumpEnabled  = false
 local jumpPower    = 55.7
 local wasJumping   = false
--- Keybind state: these store the active key strings so configs can save/restore them.
--- WindUI's Keybind element tracks the active key internally; we mirror it here.
 local aimKey  = "F"
 local jumpKey = "G"
 
--- Forward declarations so applyConfig can reference UI elements created later
 local enableToggle, notifToggle, jumpToggle, avoidSlider
 local aimKeybind, jumpKeybind
 local selectDropdown, autoDropdown
+
+-- === Active connections tracker ===
+local activeConnections = {}
+
+local function trackConnection(conn)
+    table.insert(activeConnections, conn)
+    return conn
+end
 
 local function getCurrentConfig()
     return {
@@ -87,8 +93,6 @@ local function getCurrentConfig()
         avoidRadius  = AVOID_RADIUS,
         jumpEnabled  = jumpEnabled,
         jumpPower    = jumpPower,
-        -- Read directly from the element at save time so we always get the current key,
-        -- even if the user rebound it without us catching a change event.
         aimKey       = (aimKeybind  and aimKeybind.Value)  or aimKey,
         jumpKey      = (jumpKeybind and jumpKeybind.Value) or jumpKey,
     }
@@ -101,7 +105,6 @@ local function applyConfig(data)
     if data.enabled      ~= nil then enabled      = data.enabled;      if enableToggle  then enableToggle:Set(enabled)      end end
     if data.jumpEnabled  ~= nil then jumpEnabled  = data.jumpEnabled;  if jumpToggle    then jumpToggle:Set(jumpEnabled)    end end
     if data.notifEnabled ~= nil then notifEnabled = data.notifEnabled; if notifToggle   then notifToggle:Set(notifEnabled)  end end
-    -- Restore keybinds: update our mirror variable and tell the element to display the new key
     if data.aimKey  ~= nil then aimKey  = data.aimKey;  if aimKeybind  then aimKeybind:Set(aimKey)   end end
     if data.jumpKey ~= nil then jumpKey = data.jumpKey; if jumpKeybind then jumpKeybind:Set(jumpKey)  end end
 end
@@ -118,21 +121,55 @@ local FormlessTab = Window:Tab({ Title = "Formless",  Icon = "target"    })
 local MovementTab = Window:Tab({ Title = "Movement",  Icon = "footprints" })
 local ConfigTab   = Window:Tab({ Title = "Configs",   Icon = "save"      })
 
-local SettingsSection    = FormlessTab:Section({ Title = "Settings"  })
-local AvoidSection       = FormlessTab:Section({ Title = "Avoidance" })
-local KeybindSection     = FormlessTab:Section({ Title = "Keybinds"  })
-local JumpSection        = MovementTab:Section({ Title = "Jump Power" })
-local JumpKeybindSection = MovementTab:Section({ Title = "Keybinds"  })
+local SettingsSection    = FormlessTab:Section({ Title = "Settings"      })
+local AvoidSection       = FormlessTab:Section({ Title = "Avoidance"     })
+local KeybindSection     = FormlessTab:Section({ Title = "Keybinds"      })
+local JumpSection        = MovementTab:Section({ Title = "Jump Power"    })
+local JumpKeybindSection = MovementTab:Section({ Title = "Keybinds"      })
 local ConfigSection      = ConfigTab:Section({  Title = "Config Manager" })
+local TerminateSection   = ConfigTab:Section({  Title = "Danger Zone"    })
 
 local function notify(title, content, icon, duration)
     if not notifEnabled then return end
     WindUI:Notify({ Title = title, Content = content, Icon = icon, Duration = duration or 2 })
 end
 
+-- === Terminate ===
+local function terminate()
+    enabled     = false
+    jumpEnabled = false
+
+    local character = Players.LocalPlayer.Character
+    if character then
+        local hum = character:FindFirstChildOfClass("Humanoid")
+        if hum then hum.JumpHeight = 7.2 end
+        local hrp = character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local vel = hrp.AssemblyLinearVelocity
+            hrp.AssemblyLinearVelocity = Vector3.new(vel.X, 0, vel.Z)
+        end
+    end
+
+    for _, conn in ipairs(activeConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(activeConnections)
+
+    task.delay(0.1, function()
+        pcall(function() Window:Close():Destroy() end)
+    end)
+end
+
+TerminateSection:Button({
+    Title    = "⛔ Terminate Script",
+    Callback = function()
+        task.delay(0.1, terminate)
+    end,
+})
+
 -- === Goals ===
 local goalA = Workspace.Map_Events.SIDE_A.Goal2.Net
-local goalB = Workspace.Map_Events.SIDE_B.NetHitbox1
+local goalB = Workspace.Map_Events.SIDE_B.Goal1
 local selectedGoal = goalA
 
 local function getGoalCFAndSize(goal)
@@ -179,9 +216,6 @@ avoidSlider = AvoidSection:Slider({
 })
 
 -- === Keybinds (Formless) ===
--- NOTE: WindUI Keybind callbacks fire only on keypress with no arguments.
--- We read the current key back from the element via :GetValue() after the user
--- rebinds, using a Changed listener so aimKey stays in sync for config saving.
 aimKeybind = KeybindSection:Keybind({
     Title    = "Toggle Auto-Aim",
     Value    = aimKey,
@@ -191,7 +225,6 @@ aimKeybind = KeybindSection:Keybind({
         notify("Auto-Aim", enabled and "Enabled!" or "Disabled.", enabled and "check" or "x", 2)
     end,
 })
-
 
 -- === Jump ===
 jumpToggle = JumpSection:Toggle({
@@ -228,14 +261,11 @@ jumpKeybind = JumpKeybindSection:Keybind({
     end,
 })
 
-
 -- === Config UI ===
 local configNameInput = ""
 local selectedConfig  = ""
 local autoLoadName    = getAutoLoad()
 
--- Refreshes both dropdowns with the current file list.
--- Called after every save/delete so new configs appear immediately.
 local function refreshDropdowns()
     local list = getConfigList()
     if selectDropdown then selectDropdown:Refresh(list, list[1]) end
@@ -348,27 +378,41 @@ task.defer(function()
     end
 end)
 
--- === Sliding detection ===
-local isSliding = false
-RunService.Heartbeat:Connect(function()
+-- === Sliding / possession detection ===
+local SLIDE_COOLDOWN = 0.6
+local isSliding      = false
+local slideEndedAt   = -math.huge
+
+trackConnection(RunService.Heartbeat:Connect(function()
     local character = Players.LocalPlayer.Character
     local hum = character and character:FindFirstChildOfClass("Humanoid")
     if not hum then isSliding = false return end
-    local state = hum:GetState()
+
+    local state      = hum:GetState()
+    local wasSliding = isSliding
     isSliding = (state == Enum.HumanoidStateType.PlatformStanding)
         or (state == Enum.HumanoidStateType.Running and hum.WalkSpeed <= 0)
-end)
+
+    if wasSliding and not isSliding then
+        slideEndedAt = os.clock()
+    end
+end))
+
+local function slideBlocked()
+    return isSliding or (os.clock() - slideEndedAt < SLIDE_COOLDOWN)
+end
 
 -- === Jump Loop ===
-RunService.Heartbeat:Connect(function()
+trackConnection(RunService.Heartbeat:Connect(function()
     if not jumpEnabled then wasJumping = false return end
-    if isSliding then wasJumping = false return end
+    if slideBlocked() then wasJumping = false return end
+
     local character = Players.LocalPlayer.Character
     if not character then return end
     local hrp = character:FindFirstChild("HumanoidRootPart")
     local hum = character:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum then return end
-    local state = hum:GetState()
+    local state   = hum:GetState()
     local jumping = (state == Enum.HumanoidStateType.Jumping) or (state == Enum.HumanoidStateType.Freefall)
     if jumping and not wasJumping then
         local vel = hrp.AssemblyLinearVelocity
@@ -377,7 +421,7 @@ RunService.Heartbeat:Connect(function()
     elseif not jumping then
         wasJumping = false
     end
-end)
+end))
 
 -- === Formless Logic ===
 local cachedDirection = Vector3.new(0, 0, -1)
@@ -402,7 +446,7 @@ local function getNearestPlayerToGoal(goalPos)
 end
 
 local timeSinceLastCheck = 0
-RunService.Heartbeat:Connect(function(dt)
+trackConnection(RunService.Heartbeat:Connect(function(dt)
     timeSinceLastCheck += dt
     if timeSinceLastCheck >= 2 then
         timeSinceLastCheck = 0
@@ -412,7 +456,8 @@ RunService.Heartbeat:Connect(function(dt)
     local goalCF, goalSize = getGoalCFAndSize(selectedGoal)
     local goalPos  = goalCF.Position
     cachedHalfX    = goalSize.X / 2
-    cachedRightVec = goalCF.RightVector
+    -- Flip right vector for Side B since it faces the opposite direction
+    cachedRightVec = selectedGoal == goalB and -goalCF.RightVector or goalCF.RightVector
     local nearestPlayer, nearestDist = getNearestPlayerToGoal(goalPos)
     if nearestPlayer and nearestDist < AVOID_RADIUS then
         local playerSide = (nearestPlayer.Position - goalPos):Dot(cachedRightVec)
@@ -420,9 +465,10 @@ RunService.Heartbeat:Connect(function(dt)
     else
         cachedOffsetX = (math.random() * 2 - 1) * cachedHalfX
     end
-end)
+end))
 
-RunService.RenderStepped:Connect(function()
+-- === RenderStepped — untouched from your working version ===
+trackConnection(RunService.RenderStepped:Connect(function()
     local character = Players.LocalPlayer.Character
     local hrp = character and character:FindFirstChild("HumanoidRootPart")
     local cam = Workspace.CurrentCamera
@@ -433,22 +479,30 @@ RunService.RenderStepped:Connect(function()
     local away      = (hrp.Position - targetPos).Unit
     local camY      = cam.CFrame.LookVector.Y
     cachedDirection = Vector3.new(away.X, camY, away.Z).Unit
-end)
+end))
 
--- === Auto-Aim Hook ===
-local originalNamecall
-originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-    local method = getnamecallmethod()
-    if method == "InvokeServer" and self == Event then
-        local args = { ... }
-        if enabled and args[1] == "WEAPON1" and args[2] == "BIG BANG DRIVE" then
-            args[3] = cachedDirection
-            return originalNamecall(self, table.unpack(args))
+-- === Auto-Aim Fire ===
+trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if not enabled then return end
+    if input.KeyCode == Enum.KeyCode.R then
+        -- Fresh random offset every shot for unpredictability
+        if selectedGoal then
+            local goalCF, goalSize = getGoalCFAndSize(selectedGoal)
+            local goalPos = goalCF.Position
+            local halfX   = goalSize.X / 2
+            local nearestPlayer, nearestDist = getNearestPlayerToGoal(goalPos)
+            if nearestPlayer and nearestDist < AVOID_RADIUS then
+                local playerSide = (nearestPlayer.Position - goalPos):Dot(cachedRightVec)
+                cachedOffsetX = (playerSide > 0 and -1 or 1) * (math.random(50, 100) / 100) * halfX
+            else
+                cachedOffsetX = (math.random() * 2 - 1) * halfX
+            end
         end
-        return originalNamecall(self, ...)
+        pcall(function()
+            Event:InvokeServer("WEAPON1", "BIG BANG DRIVE", cachedDirection)
+        end)
     end
-    return originalNamecall(self, ...)
-end)
+end))
 
 WindUI:Notify({ Title = "Owner Panel", Content = "Loaded! Press Right Control to toggle.", Icon = "check", Duration = 3 })
-print("[Formless] GUI loaded!")
